@@ -990,7 +990,20 @@ int do_makeconf(config *c) {
 				    str_ieq(p->repo, "core-debug") || str_ieq(p->repo, "core-staging"))
 					continue;
 			}
-					/* include every installed package outside the core repos so --makeconf never trims a live system */
+			/* skip library packages */
+			char *lowname = str_tolower_dup(p->name);
+			char *lowbase = (p->base && *p->base) ? str_tolower_dup(p->base) : NULL;
+			int islib = strncmp(lowname, "lib", 3) == 0 || (lowbase && strncmp(lowbase, "lib", 3) == 0);
+			free(lowname);
+			free(lowbase);
+			if (islib) continue;
+			/* installed entries carry repo 'local'; skip ones that actually come from core repos */
+			pkg *s = db_find_sync(p->name);
+			if (s) {
+				if (str_ieq(s->repo, "core") || str_ieq(s->repo, "core-testing") ||
+				    str_ieq(s->repo, "core-debug") || str_ieq(s->repo, "core-staging"))
+					continue;
+			}
 			const char *nm = (p->base && *p->base) ? p->base : p->name;
 			if (strs_has(&seen, nm)) continue;
 			strs_add(&seen, nm);
@@ -1069,12 +1082,12 @@ int do_makeconf(config *c) {
 	if (!is_file(example)) {
 		FILE *e = fopen(example, "w");
 		if (e) {
-			fprintf(e, "# declarative config example\\n");
-			fprintf(e, "target /etc/example.conf\\n");
-			fprintf(e, "content <<\\n");
-			fprintf(e, "example content\\n");
-			fprintf(e, "<<\\n");
-			fprintf(e, "mode 0644\\n");
+			fprintf(e, "# declarative config example\n");
+			fprintf(e, "target /etc/example.conf\n");
+			fprintf(e, "content <<\n");
+			fprintf(e, "example content\n");
+			fprintf(e, "<<\n");
+			fprintf(e, "mode 0644\n");
 			fclose(e);
 		}
 	}

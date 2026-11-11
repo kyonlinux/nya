@@ -844,7 +844,12 @@ int aur_update(config *c, txn *t) {
 		if (!l->name) continue;
 		if (l->is_host) continue;
 		if (db_find_sync(l->name)) continue;
-		strs_add(&foreign, l->name);
+		int seen = 0;
+		int fj;
+		for (fj = 0; fj < foreign.n; fj++) {
+			if (strcmp(foreign.v[fj], l->name) == 0) { seen = 1; break; }
+		}
+		if (!seen) strs_add(&foreign, l->name);
 	}
 	if (foreign.n == 0) {
 		strs_free(&foreign);

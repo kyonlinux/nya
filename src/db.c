@@ -213,6 +213,27 @@ static void sync_add(pkg *p) {
 static void local_add(pkg *p) {
 	if (!g_local_idx) g_local_idx = hmap_new(1 << 12);
 	if (!g_local_dir_idx) g_local_dir_idx = hmap_new(1 << 12);
+	/* local db dirs are keyed as <name>-<version>; drop stale versions of the same package */
+	int dup = -1;
+	int i;
+	for (i = 0; i < g_nlocal; i++) {
+		if (g_local[i]->name && p->name && strcmp(g_local[i]->name, p->name) == 0) {
+			dup = i;
+			break;
+		}
+	}
+	if (dup >= 0) {
+		if (p->version && g_local[dup]->version && vercmp(p->version, g_local[dup]->version) > 0) {
+			/* newer version replaces the stale entry */
+			pkg_free(g_local[dup]);
+			g_local[dup] = p;
+			local_index_add(p);
+			return;
+		}
+		/* stale version of an already known package: skip */
+		pkg_free(p);
+		return;
+	}
 	g_local = xrealloc(g_local, (g_nlocal + 1) * sizeof(pkg *));
 	g_local[g_nlocal++] = p;
 	local_index_add(p);
