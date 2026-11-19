@@ -478,7 +478,7 @@ NYA_CONF="$ROOT/auto/nya.conf" $NYA config >/dev/null 2>&1 || true
 ok "first-use config generation"
 
 echo "== version/help =="
-$NYA --version | grep -q "6.0.2" || fail "--version"
+$NYA --version | grep -q "6.0.3" || fail "--version"
 $NYA --help | grep -q "nya install" || fail "--help"
 echo "ok: version/help"
 echo "== sync vs update =="
@@ -907,4 +907,196 @@ EOF
 	ok "host dependencies + SUDOBIN"
 
 	echo
+	echo "== URL-installed packages are not AUR candidates =="
+	UROOT=$ROOT/urlroot
+	UBUILD=$ROOT/urlonly-build
+	mkdir -p "$UBUILD/usr/bin" "$UROOT"
+	printf '#!/bin/sh\necho urlonly\n' > "$UBUILD/usr/bin/urlonly"
+	chmod 755 "$UBUILD/usr/bin/urlonly"
+	cat > "$UBUILD/.PKGINFO" <<'EOF'
+pkgname = urlonly
+pkgbase = urlonly
+pkgver = 1.0-1
+pkgdesc = package installed from a URL
+url = https://example.com
+builddate = 1700000000
+packager = nya test
+size = 16
+arch = x86_64
+license = MIT
+EOF
+	( cd "$UBUILD" && tar --zstd -cf "$ROOT/urlonly-1.0-1-x86_64.pkg.tar.zst" . )
+	cat > "$ROOT/url.conf" <<EOF
+[options]
+RootDir = $UROOT
+DBPath = var/lib/pacman
+CacheDir = var/cache/pacman/pkg
+LogFile = $ROOT/url-nya.log
+Architecture = x86_64
+aur = true
+searchhost = false
+
+[extra]
+Server = file://$REPO
+EOF
+	$NYA --config "$ROOT/url.conf" -U "file://$ROOT/urlonly-1.0-1-x86_64.pkg.tar.zst" --noconfirm >/dev/null || fail "URL install"
+	[ -f "$UROOT/var/lib/pacman/local/urlonly-1.0-1/nya-url" ] || fail "URL install did not record its origin"
+	mkdir -p "$UROOT/var/lib/dkms/nvidia/9.9.9"
+	ln -s "$UROOT/usr/src/nvidia-9.9.9" "$UROOT/var/lib/dkms/nvidia/9.9.9/source"
+	touch "$UROOT/var/lib/dkms/nvidia/9.9.9/stale-marker"
+	$NYA --config "$ROOT/url.conf" -U "file://$ROOT/urlonly-1.0-1-x86_64.pkg.tar.zst" --noconfirm >/dev/null || fail "reinstall urlonly"
+	[ ! -e "$UROOT/var/lib/dkms/nvidia/9.9.9" ] || fail "stale DKMS tree not pruned"
+	upout=$($NYA --config "$ROOT/url.conf" update --noconfirm 2>&1) || fail "update with URL package"
+	echo "$upout" | grep -q "checking for AUR updates" && fail "URL-installed package was treated as an AUR package"
+	ok "URL package origin recorded"
+
+	echo "== versioned deps prefer matching version =="
+	VT=$ROOT/version-test
+	VREPO=$VT/repo
+	VROOT=$VT/root
+	mkdir -p "$VREPO" "$VT/build" "$VT/db-extra" "$VT/db-overlay"
+	vpkg() {
+		local name=$1 ver=$2 file=$3 content=$4 dep=${5:-} conflict=${6:-}
+		local d=$VT/build/$name-$ver
+		mkdir -p "$d/$(dirname "$file")"
+		printf '%s\n' "$content" > "$d/$file"
+		{
+			printf 'pkgname = %s\n' "$name"
+			printf 'pkgbase = %s\n' "$name"
+			printf 'pkgver = %s\n' "$ver"
+			printf 'pkgdesc = versioned test %s\n' "$name"
+			printf 'url = https://example.com\nbuilddate = 1700000000\n'
+			printf 'packager = nya test\nsize = 16\narch = x86_64\nlicense = MIT\n'
+			[ -n "$dep" ] && printf 'depend = %s\n' "$dep"
+			[ -n "$conflict" ] && printf 'conflict = %s\n' "$conflict"
+		} > "$d/.PKGINFO"
+		( cd "$d" && tar --zstd -cf "$VREPO/$name-$ver-x86_64.pkg.tar.zst" . )
+	}
+	vdb() {
+		local repo=$1 name=$2 ver=$3 dep=${4:-} file=$5 conflict=${6:-}
+		local d=$VT/db-$repo/$name-$ver
+		mkdir -p "$d"
+		local sha
+		sha=$(sha256sum "$VREPO/$name-$ver-x86_64.pkg.tar.zst" | awk '{print $1}')
+		cat > "$d/desc" <<EOF
+%NAME%
+$name
+
+%BASE%
+$name
+
+%VERSION%
+$ver
+
+%DESC%
+versioned test $name
+
+%URL%
+https://example.com
+
+%ARCH%
+x86_64
+
+%BUILDDATE%
+1700000000
+
+%PACKAGER%
+nya test
+
+%SIZE%
+16
+
+%CSIZE%
+16
+
+%SHA256SUM%
+$sha
+
+%LICENSE%
+MIT
+
+%DEPENDS%
+$dep
+EOF
+		if [ -n "$conflict" ]; then
+			printf '\n%%CONFLICTS%%\n%s\n' "$conflict" >> "$d/desc"
+		fi
+		cat > "$d/files" <<EOF
+%FILES%
+$(dirname "$file")/
+$file
+EOF
+	}
+	vpkg foo 2.0-1 usr/lib/foo-2 "foo two" ""
+	vpkg foo 1.0-2 usr/lib/foo-1 "foo one" ""
+	vpkg bar 1.0-1 usr/bin/bar "bar" "foo=1.0"
+	vpkg confa 1.0-1 usr/bin/confa "confa" ""
+	vpkg confb 1.0-1 usr/bin/confb "confb" "" "confa"
+	vpkg confc 1.0-1 usr/bin/confc "confc" "" "confd"
+	vpkg confd 1.0-1 usr/bin/confd "confd" ""
+	vpkg dkmsfoo 1.0-1 usr/src/foo-1.0/dkms.conf "old source" ""
+	vdb extra foo 2.0-1 "" usr/lib/foo-2
+	vdb overlay foo 1.0-2 "" usr/lib/foo-1
+	vdb extra bar 1.0-1 "foo=1.0" usr/bin/bar
+	vdb extra confa 1.0-1 "" usr/bin/confa ""
+	vdb extra confb 1.0-1 "" usr/bin/confb "confa"
+	vdb extra confc 1.0-1 "" usr/bin/confc "confd"
+	vdb extra confd 1.0-1 "" usr/bin/confd ""
+	vdb extra dkmsfoo 1.0-1 "" usr/src/foo-1.0/dkms.conf
+	( cd "$VT/db-extra" && tar -czf "$VREPO/extra.db" . )
+	( cd "$VT/db-overlay" && tar -czf "$VREPO/overlay.db" . )
+	cat > "$VT/nya.conf" <<EOF
+[options]
+RootDir = $VROOT
+DBPath = var/lib/pacman
+CacheDir = var/cache/pacman/pkg
+LogFile = $VT/nya.log
+Architecture = x86_64
+searchhost = false
+
+[extra]
+Server = file://$VREPO
+
+[overlay]
+Server = file://$VREPO
+EOF
+	VCFG="--config $VT/nya.conf"
+	$NYA $VCFG -Sy --noconfirm >/dev/null || fail "version test sync"
+	$NYA $VCFG install confa --noconfirm >/dev/null || fail "install confa"
+	$NYA $VCFG install confb --noconfirm >/dev/null || fail "install confb with conflict"
+	[ ! -e "$VROOT/usr/bin/confa" ] || fail "conflicting package was not removed"
+	$NYA $VCFG -Q | grep -q "^confb 1.0-1$" || fail "confb not installed"
+	$NYA $VCFG -Q | grep -q "^confa " && fail "confa still in local db after conflict removal"
+	$NYA $VCFG install confc --noconfirm >/dev/null || fail "install confc"
+	$NYA $VCFG install confd --noconfirm >/dev/null || fail "install confd with reverse conflict"
+	[ ! -e "$VROOT/usr/bin/confc" ] || fail "reverse-conflicting package was not removed"
+	$NYA $VCFG -Q | grep -q "^confd 1.0-1$" || fail "confd not installed"
+	$NYA $VCFG install bar --noconfirm >/dev/null || fail "install bar with versioned dep"
+	$NYA $VCFG -Q | grep -q "^foo 1.0-2$" || fail "versioned dep should pick foo 1.0-2 (pkgrel ignored when unspecified)"
+	$NYA $VCFG -Q | grep -q "^foo 2.0-1$" && fail "versioned dep installed foo 2.0-1 (constraint ignored)"
+	ok "versioned dependency resolution"
+
+	echo "== upgrade hooks receive old-only file paths =="
+	mkdir -p "$VROOT/usr/share/libalpm/hooks"
+	cat > "$VROOT/usr/share/libalpm/hooks/05-dkms-old-source.hook" <<EOF
+[Trigger]
+Operation = Remove
+Type = Path
+Target = usr/src/foo-*/dkms.conf
+
+[Action]
+When = PreTransaction
+Exec = /bin/sh -c 'cat > $VT/old-dkms-paths.txt'
+NeedsTargets
+EOF
+	$NYA $VCFG install dkmsfoo --noconfirm >/dev/null || fail "install dkmsfoo 1.0"
+	vpkg dkmsfoo 2.0-1 usr/src/foo-2.0/dkms.conf "new source" ""
+	vdb extra dkmsfoo 2.0-1 "" usr/src/foo-2.0/dkms.conf
+	( cd "$VT/db-extra" && tar -czf "$VREPO/extra.db" . )
+	$NYA $VCFG -Sy --noconfirm >/dev/null || fail "version test resync"
+	$NYA $VCFG install dkmsfoo --noconfirm >/dev/null || fail "upgrade dkmsfoo"
+	[ -f "$VT/old-dkms-paths.txt" ] || fail "upgrade did not trigger old-dkms Remove path hook"
+	grep -q "^usr/src/foo-1.0/dkms.conf$" "$VT/old-dkms-paths.txt" || fail "upgrade hook did not receive the old DKMS source path"
+	ok "upgrade hook removes old DKMS source"
+
 echo "ALL TESTS PASSED"

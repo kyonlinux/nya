@@ -21,7 +21,7 @@
 #include <sys/file.h>
 #include <strings.h>
 
-#define NYA_VERSION "6.0.2"
+#define NYA_VERSION "6.0.3"
 
 typedef struct {
 	char **v;
@@ -256,6 +256,7 @@ typedef struct pkg {
 	int reason;
 	int is_local;
 	int is_host;
+	int is_url;
 	int has_mtree;
 	int is_upgrade;
 	int is_reinstall;
@@ -372,7 +373,7 @@ int txn_print_summary(config *c, txn *t, int mode);
 int txn_scan_archives(config *c, txn *t);
 int txn_has_systemd_units(txn *t);
 void daemon_reload(void);
-void driver_post_install(txn *t);
+void driver_post_install(config *c, txn *t);
 
 int refresh_dbs(config *c, int force);
 int do_search(config *c, const char **terms, int n, int local);

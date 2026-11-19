@@ -141,9 +141,17 @@ static int rm_matches(txn *t, const depspec *dep) {
 	return list_matches(t->rm_name, t->rm_prov, dep);
 }
 
+static pkg *sync_provider_versioned(const char *name, const depspec *dep);
+
 static pkg *sync_provider(const depspec *dep) {
+	/* Prefer the exact package name, but honour version constraints.  The
+	 * sync DB may contain several versions of a package (e.g. extra and an
+	 * overlay repo), and blindly returning the first one can pull in a
+	 * version that does not satisfy a pinned dependency. */
 	pkg *exact = db_find_sync(dep->name);
-	if (exact) return exact;
+	if (exact && pkg_matches_dep(exact, dep)) return exact;
+	pkg *versioned = sync_provider_versioned(dep->name, dep);
+	if (versioned) return versioned;
 	strs *provs = db_sync_providers(dep->name);
 	if (provs) {
 		int i;
@@ -151,7 +159,6 @@ static pkg *sync_provider(const depspec *dep) {
 			pkg *q = db_find_sync(provs->v[i]);
 			if (q && pkg_matches_dep(q, dep)) return q;
 		}
-		return NULL;
 	}
 	int i;
 	for (i = 0; i < g_nsync; i++) {
@@ -272,6 +279,7 @@ int txn_build_install(config *c, const char **targets, int ntargets, txn *t, str
 				pkg_free(p);
 				return -1;
 			}
+			p->is_url = 1;
 			if (p->csize == 0) p->csize = 0;
 			txn_add_add(t, p);
 			continue;
@@ -471,10 +479,16 @@ static int txn_check_conflicts(config *c, txn *t) {
 				if (in_rm(t, l->name)) continue;
 				if (!pkg_matches_dep(l, &cd)) continue;
 				if (replaced_by_add(t, l)) continue;
-				error("failed to prepare transaction (conflicting packages)");
-				error("%s conflicts with %s", l->name, p->name);
-				depspec_free(&cd);
-				return -1;
+				if (in_add(t, l->name)) {
+					error("failed to prepare transaction (conflicting packages)");
+					error("%s conflicts with %s", l->name, p->name);
+					depspec_free(&cd);
+					return -1;
+				}
+				/* Pacman offers to remove the conflicting package.  Do the
+				 * same here; the final transaction prompt still applies. */
+				txn_add_rm(t, l);
+				msg("%sremoving %s due to conflict with %s%s", col_green(), l->name, p->name, col_reset());
 			}
 			depspec_free(&cd);
 		}
@@ -492,6 +506,26 @@ static int txn_check_conflicts(config *c, txn *t) {
 				}
 			}
 			depspec_free(&rd);
+		}
+		/* The installed package may declare the conflict in the other
+		 * direction (e.g. nvidia-open-dkms Conflicts nvidia-open). */
+		int k;
+		for (k = 0; k < g_nlocal; k++) {
+			pkg *l = g_local[k];
+			if (!l->name || strcmp(l->name, p->name) == 0) continue;
+			if (in_rm(t, l->name) || in_add(t, l->name)) continue;
+			int lc;
+			int conflicting = 0;
+			for (lc = 0; lc < l->conflicts.n && !conflicting; lc++) {
+				depspec cd;
+				depspec_parse(l->conflicts.v[lc], &cd);
+				if (pkg_matches_dep(p, &cd)) conflicting = 1;
+				depspec_free(&cd);
+			}
+			if (conflicting) {
+				txn_add_rm(t, l);
+				msg("%sremoving %s due to conflict with %s%s", col_green(), l->name, p->name, col_reset());
+			}
 		}
 	}
 	for (i = 0; i < g_nlocal; i++) {

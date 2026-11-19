@@ -170,7 +170,9 @@ int vercmp(const char *a, const char *b) {
 	ver_split(b, &eb, &epb, &mb, &mbl, &rb, &rbl);
 	if (epa != epb) return epa < epb ? -1 : 1;
 	int rc = rpmvercmp(ma, mal, mb, mbl);
-	if (rc == 0) rc = rpmvercmp(ra, ral, rb, rbl);
+	/* Match pacman: only compare pkgrel when both versions specify one.
+	 * This makes '=1.2.3' satisfy '1.2.3-4', as PKGBUILD version deps rely on. */
+	if (rc == 0 && ral > 0 && rbl > 0) rc = rpmvercmp(ra, ral, rb, rbl);
 	return rc;
 }
 

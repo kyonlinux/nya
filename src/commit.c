@@ -380,6 +380,7 @@ static void remove_old_files(config *c, pkg *p, const pkg *newp, int keep_backup
 }
 
 static int remove_pkg(config *c, pkg *p, int nosave) {
+	if (!p->files_loaded) db_load_local_pkg_files(c, p);
 	if (p->install_data && p->install_len > 0) {
 		run_scriptlet(c, p->install_data, p->install_len, "pre_remove", NULL, NULL);
 	}
@@ -671,8 +672,28 @@ int txn_print_summary(config *c, txn *t, int mode) {
 typedef struct hookev {
 	char *op;
 	char *name;
-	strs paths;
+	/* File triggers need to distinguish files that are newly installed,
+	 * replaced in-place, and dropped during an upgrade.  libalpm matches
+	 * these against the Install, Upgrade and Remove operations
+	 * respectively; treating an upgrade as a single Install event leaves
+	 * stale files (notably old DKMS source trees) unhandled. */
+	strs install_paths;
+	strs upgrade_paths;
+	strs remove_paths;
 } hookev;
+
+static const strs *hookev_paths_for_op(const hookev *e, const char *op) {
+	if (strcmp(op, "Install") == 0) return &e->install_paths;
+	if (strcmp(op, "Upgrade") == 0) return &e->upgrade_paths;
+	if (strcmp(op, "Remove") == 0) return &e->remove_paths;
+	return NULL;
+}
+
+static void hookev_add_path(strs *out, const char *rootdir, const char *rel) {
+	char p[4300];
+	snprintf(p, sizeof p, "%s/%s", rootdir, rel);
+	if (!strs_has(out, p)) strs_add(out, p);
+}
 
 typedef struct hookfile {
 	strs ops;
@@ -827,20 +848,97 @@ static int run_sh_pipe(config *c, const char *cmd, const char *stdin_data) {
 	return -1;
 }
 
+static pkg *hook_find_local(const char *name) {
+	pkg *p = db_find_local(name);
+	if (p) return p;
+	/* During post-transaction hooks the old local-db index entry is already
+	 * gone, but the package object is still in g_local until the final
+	 * reload.  Keep using it so upgrade path categories remain correct. */
+	int i;
+	for (i = 0; i < g_nlocal; i++) {
+		if (g_local[i]->name && strcmp(g_local[i]->name, name) == 0) return g_local[i];
+	}
+	return NULL;
+}
+
+static void dkms_prune_stale(config *c) {
+	char base[4096];
+	snprintf(base, sizeof base, "%s/var/lib/dkms", c->rootdir);
+	DIR *md = opendir(base);
+	if (!md) return;
+	struct dirent *me;
+	while ((me = readdir(md)) != NULL) {
+		if (me->d_name[0] == '.') continue;
+		char moddir[4300];
+		snprintf(moddir, sizeof moddir, "%s/%s", base, me->d_name);
+		if (!is_dir(moddir)) continue;
+		DIR *vd = opendir(moddir);
+		if (!vd) continue;
+		struct dirent *ve;
+		while ((ve = readdir(vd)) != NULL) {
+			if (ve->d_name[0] == '.') continue;
+			char verdir[4400], src[4500];
+			snprintf(verdir, sizeof verdir, "%s/%s", moddir, ve->d_name);
+			if (!is_dir(verdir)) continue;
+			snprintf(src, sizeof src, "%s/source", verdir);
+			struct stat lst;
+			if (lstat(src, &lst) != 0 || !S_ISLNK(lst.st_mode)) continue;
+			struct stat st;
+			if (stat(src, &st) == 0) continue;
+			/* dkms leaves a dangling "source" symlink after a package
+			 * upgrade removes the old /usr/src tree.  Such entries make
+			 * every later dkms invocation fail before it even reaches the
+			 * package being installed, so clear just those trees. */
+			warn("removing stale DKMS tree %s/%s (source link target is missing)",
+			     me->d_name, ve->d_name);
+			rm_rf(verdir);
+		}
+		closedir(vd);
+	}
+	closedir(md);
+}
+
 int run_hooks(config *c, txn *t, int pre) {
+	if (pre) dkms_prune_stale(c);
 	int nevents = t->nadd + t->nrm;
 	if (nevents == 0) return 0;
 	hookev *ev = xcalloc(nevents, sizeof *ev);
 	int ei = 0;
 	int i;
 	for (i = 0; i < t->nadd; i++) {
-		ev[ei].op = xstrdup(t->add[i]->is_upgrade ? "Upgrade" : "Install");
-		ev[ei].name = xstrdup(t->add[i]->name);
+		pkg *p = t->add[i];
+		ev[ei].op = xstrdup(p->is_upgrade ? "Upgrade" : "Install");
+		ev[ei].name = xstrdup(p->name);
+		pkg *old = p->is_upgrade ? hook_find_local(p->name) : NULL;
+		hmap *oldset = NULL, *newset = NULL;
 		int j;
-		for (j = 0; j < t->add[i]->files.n; j++) {
-			char p[4300];
-			snprintf(p, sizeof p, "%s/%s", c->rootdir, t->add[i]->files.v[j]);
-			strs_add(&ev[ei].paths, p);
+		if (old) {
+			/* Light DB loads do not read file lists; hooks still need the
+			 * old package's paths to clean up superseded files (DKMS
+			 * source trees in particular). */
+			if (!old->files_loaded) db_load_local_pkg_files(c, old);
+			oldset = hmap_new(old->files.n * 2 + 16);
+			for (j = 0; j < old->files.n; j++) hmap_put(oldset, old->files.v[j], (void *)1);
+		}
+		if (old && p->files.n) {
+			newset = hmap_new(p->files.n * 2 + 16);
+			for (j = 0; j < p->files.n; j++) hmap_put(newset, p->files.v[j], (void *)1);
+		}
+		for (j = 0; j < p->files.n; j++) {
+			/* A path present in both old and new package is an upgrade
+			 * trigger; a path only in the new package is an install. */
+			if (oldset && hmap_has(oldset, p->files.v[j]))
+				hookev_add_path(&ev[ei].upgrade_paths, c->rootdir, p->files.v[j]);
+			else
+				hookev_add_path(&ev[ei].install_paths, c->rootdir, p->files.v[j]);
+		}
+		if (old) {
+			for (j = 0; j < old->files.n; j++) {
+				if (newset && hmap_has(newset, old->files.v[j])) continue;
+				hookev_add_path(&ev[ei].remove_paths, c->rootdir, old->files.v[j]);
+			}
+			hmap_free(oldset);
+			hmap_free(newset);
 		}
 		ei++;
 	}
@@ -848,11 +946,8 @@ int run_hooks(config *c, txn *t, int pre) {
 		ev[ei].op = xstrdup("Remove");
 		ev[ei].name = xstrdup(t->rm[i]->name);
 		int j;
-		for (j = 0; j < t->rm[i]->files.n; j++) {
-			char p[4300];
-			snprintf(p, sizeof p, "%s/%s", c->rootdir, t->rm[i]->files.v[j]);
-			strs_add(&ev[ei].paths, p);
-		}
+		for (j = 0; j < t->rm[i]->files.n; j++)
+			hookev_add_path(&ev[ei].remove_paths, c->rootdir, t->rm[i]->files.v[j]);
 		ei++;
 	}
 	const char *hdirs[2] = {"/usr/share/libalpm/hooks", "/etc/pacman.d/hooks"};
@@ -879,30 +974,28 @@ int run_hooks(config *c, txn *t, int pre) {
 		int matched = 0;
 		int k;
 		for (k = 0; k < nevents && !matched; k++) {
-			int op_ok = 0;
 			int o2;
-			for (o2 = 0; o2 < hf.ops.n; o2++) {
-				if (strcmp(hf.ops.v[o2], ev[k].op) == 0) {
-					op_ok = 1;
-					break;
-				}
-			}
-			if (!op_ok) continue;
-			int t2;
-			for (t2 = 0; t2 < hf.types.n && !matched; t2++) {
-				if (str_ieq(hf.types.v[t2], "Package")) {
-					int g;
-					for (g = 0; g < hf.targets.n && !matched; g++) {
-						if (fnmatch(hf.targets.v[g], ev[k].name, 0) == 0) matched = 1;
-					}
-				} else {
-					int g;
-					for (g = 0; g < hf.targets.n && !matched; g++) {
-						int p2;
-						for (p2 = 0; p2 < ev[k].paths.n && !matched; p2++) {
-							const char *rel = ev[k].paths.v[p2] + strlen(c->rootdir);
-							while (*rel == '/') rel++;
-							if (fnmatch(hf.targets.v[g], rel, 0) == 0) matched = 1;
+			for (o2 = 0; o2 < hf.ops.n && !matched; o2++) {
+				const char *hop = hf.ops.v[o2];
+				int t2;
+				for (t2 = 0; t2 < hf.types.n && !matched; t2++) {
+					if (str_ieq(hf.types.v[t2], "Package")) {
+						if (strcmp(ev[k].op, hop) != 0) continue;
+						int g;
+						for (g = 0; g < hf.targets.n && !matched; g++) {
+							if (fnmatch(hf.targets.v[g], ev[k].name, 0) == 0) matched = 1;
+						}
+					} else {
+						const strs *paths = hookev_paths_for_op(&ev[k], hop);
+						if (!paths) continue;
+						int g;
+						for (g = 0; g < hf.targets.n && !matched; g++) {
+							int p2;
+							for (p2 = 0; p2 < paths->n && !matched; p2++) {
+								const char *rel = paths->v[p2] + strlen(c->rootdir);
+								while (*rel == '/') rel++;
+								if (fnmatch(hf.targets.v[g], rel, 0) == 0) matched = 1;
+							}
 						}
 					}
 				}
@@ -947,36 +1040,34 @@ int run_hooks(config *c, txn *t, int pre) {
 			int matched = 0;
 			int k;
 			for (k = 0; k < nevents; k++) {
-				int op_ok = 0;
 				int o2;
 				for (o2 = 0; o2 < hf.ops.n; o2++) {
-					if (strcmp(hf.ops.v[o2], ev[k].op) == 0) {
-						op_ok = 1;
-						break;
-					}
-				}
-				if (!op_ok) continue;
-				int t2;
-				for (t2 = 0; t2 < hf.types.n; t2++) {
-					if (str_ieq(hf.types.v[t2], "Package")) {
-						int g;
-						for (g = 0; g < hf.targets.n; g++) {
-							if (fnmatch(hf.targets.v[g], ev[k].name, 0) == 0) {
-								if (!strs_has(&targets_s, ev[k].name)) strs_add(&targets_s, ev[k].name);
-								matched = 1;
-							}
-						}
-					} else {
-						int g;
-						for (g = 0; g < hf.targets.n; g++) {
-							int p2;
-							for (p2 = 0; p2 < ev[k].paths.n; p2++) {
-								const char *rel = ev[k].paths.v[p2] + strlen(c->rootdir);
-								while (*rel == '/') rel++;
-								if (fnmatch(hf.targets.v[g], rel, 0) == 0) {
-									if (!strs_has(&files_s, ev[k].paths.v[p2])) strs_add(&files_s, ev[k].paths.v[p2]);
-									if (!strs_has(&files_rel_s, rel)) strs_add(&files_rel_s, rel);
+					const char *hop = hf.ops.v[o2];
+					int t2;
+					for (t2 = 0; t2 < hf.types.n; t2++) {
+						if (str_ieq(hf.types.v[t2], "Package")) {
+							if (strcmp(ev[k].op, hop) != 0) continue;
+							int g;
+							for (g = 0; g < hf.targets.n; g++) {
+								if (fnmatch(hf.targets.v[g], ev[k].name, 0) == 0) {
+									if (!strs_has(&targets_s, ev[k].name)) strs_add(&targets_s, ev[k].name);
 									matched = 1;
+								}
+							}
+						} else {
+							const strs *paths = hookev_paths_for_op(&ev[k], hop);
+							if (!paths) continue;
+							int g;
+							for (g = 0; g < hf.targets.n; g++) {
+								int p2;
+								for (p2 = 0; p2 < paths->n; p2++) {
+									const char *rel = paths->v[p2] + strlen(c->rootdir);
+									while (*rel == '/') rel++;
+									if (fnmatch(hf.targets.v[g], rel, 0) == 0) {
+										if (!strs_has(&files_s, paths->v[p2])) strs_add(&files_s, paths->v[p2]);
+										if (!strs_has(&files_rel_s, rel)) strs_add(&files_rel_s, rel);
+										matched = 1;
+									}
 								}
 							}
 						}
@@ -1045,7 +1136,9 @@ int run_hooks(config *c, txn *t, int pre) {
 	for (i = 0; i < nevents; i++) {
 		free(ev[i].op);
 		free(ev[i].name);
-		strs_free(&ev[i].paths);
+		strs_free(&ev[i].install_paths);
+		strs_free(&ev[i].upgrade_paths);
+		strs_free(&ev[i].remove_paths);
 	}
 	free(ev);
 	return 0;
@@ -1087,7 +1180,7 @@ int txn_commit(config *c, txn *t) {
 		}
 	}
 	run_hooks(c, t, 0);
-	driver_post_install(t);
+	driver_post_install(c, t);
 	log_alpm("transaction completed");
 	unlock_db();
 	save_world_additions(c, t);
@@ -1114,7 +1207,7 @@ int install_pkgfile(config *c, const char *path) {
 	snprintf(label, sizeof label, "installing %s", p->name);
 	int rc = install_pkg(c, p, &dummy, label);
 	run_hooks(c, &dummy, 0);
-	driver_post_install(&dummy);
+	driver_post_install(c, &dummy);
 	g_nlocal = 0;
 	free(g_local);
 	g_local = NULL;

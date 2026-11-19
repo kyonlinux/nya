@@ -4,8 +4,16 @@
 typedef struct {
 	regex_t re;
 	int ok;
+	int literal;
 	const char *term;
 } needle;
+
+static int term_is_literal(const char *s) {
+	for (; *s; s++) {
+		if (strchr(".^$*+?()[]{}|\\", *s)) return 0;
+	}
+	return 1;
+}
 
 int do_search(config *c, const char **terms, int n, int local) {
 	(void)c;
@@ -14,7 +22,8 @@ int do_search(config *c, const char **terms, int n, int local) {
 	needle *nd = xcalloc(n, sizeof *nd);
 	for (i = 0; i < n; i++) {
 		nd[i].term = terms[i];
-		nd[i].ok = regcomp(&nd[i].re, terms[i], REG_EXTENDED | REG_NOSUB) == 0;
+		nd[i].literal = term_is_literal(terms[i]);
+		nd[i].ok = !nd[i].literal && regcomp(&nd[i].re, terms[i], REG_EXTENDED | REG_NOSUB) == 0;
 	}
 	pkg **pkgs = local ? g_local : g_sync;
 	int npkgs = local ? g_nlocal : g_nsync;
@@ -204,6 +213,7 @@ int do_files(config *c, const char **targets, int n) {
 			error("package '%s' was not found", targets[i]);
 			return -1;
 		}
+		if (!p->files_loaded) db_load_local_pkg_files(c, p);
 		int j;
 		for (j = 0; j < p->files.n; j++) {
 			printf("%s %s/%s\n", p->name, c->rootdir[1] ? c->rootdir : "", p->files.v[j]);
@@ -220,6 +230,7 @@ int do_check(config *c, const char **targets, int n, int deep) {
 			error("package '%s' was not found", targets[i]);
 			return -1;
 		}
+		if (!p->files_loaded) db_load_local_pkg_files(c, p);
 		hmap *sha = NULL;
 		if (deep) {
 			if (pkg_load_mtree(p) != 0) continue;

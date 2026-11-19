@@ -239,24 +239,6 @@ static void local_add(pkg *p) {
 	local_index_add(p);
 }
 
-static pkg *sync_find_dir(const char *reponame, const char *dir) {
-	if (g_sync_idx) {
-		char tmp[1100];
-		snprintf(tmp, sizeof tmp, "%s/%s", reponame, dir);
-		return hmap_get(g_sync_idx, tmp);
-	}
-	int i;
-	for (i = 0; i < g_nsync; i++) {
-		pkg *p = g_sync[i];
-		if (strcmp(p->repo, reponame) != 0) continue;
-		if (!p->name || !p->version) continue;
-		char tmp[1024];
-		snprintf(tmp, sizeof tmp, "%s-%s", p->name, p->version);
-		if (strcmp(tmp, dir) == 0) return p;
-	}
-	return NULL;
-}
-
 static void name_version_split(const char *dir, char *name, size_t nlen, char *ver, size_t vlen) {
 	const char *dash = strrchr(dir, '-');
 	if (dash) {
@@ -405,6 +387,7 @@ int db_load_sync_with_flags(config *c, const char *dbfile, const char *reponame,
 	tar_entry e;
 	pkg *cur = NULL;
 	char curdir[1024] = "";
+	hmap *dirmap = hmap_new(1 << 14);
 	while (tar_next(&t, &e) > 0) {
 		const char *entry = e.name;
 		if (startswith(entry, "./")) entry += 2;
@@ -421,7 +404,7 @@ int db_load_sync_with_flags(config *c, const char *dbfile, const char *reponame,
 		const char *fname = slash + 1;
 		if (strcmp(curdir, dir) != 0) {
 			snprintf(curdir, sizeof curdir, "%s", dir);
-			cur = sync_find_dir(reponame, dir);
+			cur = hmap_get(dirmap, dir);
 			if (!cur) {
 				char name[512], ver[512];
 				name_version_split(dir, name, sizeof name, ver, sizeof ver);
@@ -429,6 +412,7 @@ int db_load_sync_with_flags(config *c, const char *dbfile, const char *reponame,
 				cur->name = xstrdup(name);
 				cur->version = xstrdup(ver);
 				sync_add(cur);
+				hmap_put(dirmap, dir, cur);
 			}
 		}
 		char *data = NULL;
@@ -463,6 +447,7 @@ int db_load_sync_with_flags(config *c, const char *dbfile, const char *reponame,
 			free(data);
 		}
 	}
+	hmap_free(dirmap);
 	rd_close(r);
 	return 0;
 }
@@ -512,6 +497,8 @@ int db_load_local_light(config *c) {
 		free(data);
 		snprintf(path, sizeof path, "%s/nya-host", entry);
 		if (is_file(path)) p->is_host = 1;
+		snprintf(path, sizeof path, "%s/nya-url", entry);
+		if (is_file(path)) p->is_url = 1;
 		
 		if (!p->name) {
 			char name[512], ver[512];
@@ -531,11 +518,10 @@ int db_load_local_pkg_files(config *c, pkg *p) {
 	
 	if (p->files_loaded) return 0;
 	char entry[4096];
-	snprintf(entry, sizeof entry, "%s/local/%s", c->dbpath, p->name);
-	
 	char *localdir_path = NULL;
-	if (g_local_idx) {
-		localdir_path = *(char **)hmap_get(g_local_idx, p->name);
+	if (p->name && p->version && *p->name && *p->version) {
+		snprintf(entry, sizeof entry, "%s/local/%s-%s", c->dbpath, p->name, p->version);
+		if (is_dir(entry)) localdir_path = xstrdup(entry);
 	}
 	if (!localdir_path) {
 		
@@ -630,6 +616,8 @@ int db_load_local(config *c) {
 		free(data);
 		snprintf(path, sizeof path, "%s/nya-host", entry);
 		if (is_file(path)) p->is_host = 1;
+		snprintf(path, sizeof path, "%s/nya-url", entry);
+		if (is_file(path)) p->is_url = 1;
 		snprintf(path, sizeof path, "%s/files", entry);
 		data = read_file(path, NULL);
 		if (data) {
@@ -778,8 +766,8 @@ pkg *db_find_local(const char *name) {
 
 void db_build_owner_map(void) {
 	db_owner_map_free();
-	g_owner = hmap_new(1 << 15);
-	g_owner_multi = hmap_new(1 << 15);
+	g_owner = hmap_new(1 << 20);
+	g_owner_multi = hmap_new(1 << 17);
 	int i, j;
 	for (i = 0; i < g_nlocal; i++) {
 		pkg *p = g_local[i];
@@ -788,8 +776,20 @@ void db_build_owner_map(void) {
 			const char *f = p->files.v[j];
 			size_t fl = strlen(f);
 			if (fl == 0) continue;
-			if (f[fl - 1] != '/' && !hmap_has(g_owner, f)) hmap_put(g_owner, f, p->name);
-			owner_multi_add(f, p->name);
+			if (f[fl - 1] != '/') {
+				const char *prev = hmap_get(g_owner, f);
+				if (!prev) {
+					hmap_put(g_owner, f, p->name);
+				} else if (strcmp(prev, p->name) != 0) {
+					/* Shared regular file: removal must not delete it
+					 * while another package still owns it. */
+					owner_multi_add(f, prev);
+					owner_multi_add(f, p->name);
+				}
+			} else {
+				/* Directories are always potentially shared. */
+				owner_multi_add(f, p->name);
+			}
 		}
 	}
 }
@@ -942,6 +942,12 @@ int db_write_local_pkg(config *c, pkg *p) {
 		snprintf(final, sizeof final, "%s/install", dir);
 		write_file(tmp, p->install_data, p->install_len, 0644);
 		rename(tmp, final);
+	}
+	snprintf(tmp, sizeof tmp, "%s/nya-url", dir);
+	if (p->is_url) {
+		write_file(tmp, "installed from a package file or URL\n", 37, 0644);
+	} else {
+		unlink(tmp);
 	}
 	return 0;
 }

@@ -872,19 +872,32 @@ int cli_main(int argc, char **argv) {
 	}
 	int needs_dbs = 0;
 	int load_mode = 0;  
-	if (cl.op == 'Q' || cl.op == 'R' || cl.op == 'U' || cl.op == 'W' || cl.op == 'X') {
+	if (cl.op == 'Q') {
 		needs_dbs = 1;
-		load_mode = 0;  
+		if (cl.m || cl.u) load_mode = 4;      /* sync metadata + local metadata */
+		else if (cl.o) load_mode = 2;         /* need the file owner map */
+		else load_mode = 3;                   /* local metadata only */
+	} else if (cl.op == 'R' || cl.op == 'W' || cl.op == 'X') {
+		needs_dbs = 1;
+		load_mode = 2;  /* local database + file owner map */
+	} else if (cl.op == 'U') {
+		needs_dbs = 1;
+		load_mode = 0;
 	} else if (cl.op == 'S') {
 		if (cl.y && !cl.u && !cl.s && cl.i == 0 && cl.cclean == 0 && cl.targets.n == 0) {
 			needs_dbs = 0;  
+		} else if (cl.s || cl.i > 0) {
+			/* search/info need full sync metadata, but not local file lists
+			 * or the expensive file-owner map */
+			needs_dbs = 1;
+			load_mode = 4;
 		} else if (cl.targets.n > 0 && cl.i == 0 && cl.s == 0) {
 			
 			needs_dbs = 1;
-			load_mode = 1;  
+			load_mode = 5;  /* sync metadata + local file owner map */
 		} else {
 			needs_dbs = 1;
-			load_mode = 0;  
+			load_mode = 4;  /* upgrade check needs metadata, not file lists */
 		}
 	} else if (cl.op == 'a' || cl.op == 'H' || cl.op == 'D' || cl.op == 'M' || cl.op == 'B') {
 		needs_dbs = 1;
@@ -893,6 +906,16 @@ int cli_main(int argc, char **argv) {
 	if (needs_dbs) {
 		if (load_mode == 1) {
 			db_load_all_light(c);  
+		} else if (load_mode == 2) {
+			db_load_local(c);
+		} else if (load_mode == 3) {
+			db_load_local_light(c);
+		} else if (load_mode == 4) {
+			db_load_sync_all(c);
+			db_load_local_light(c);
+		} else if (load_mode == 5) {
+			db_load_sync_all(c);
+			db_load_local(c);
 		} else {
 			db_load_all(c);
 		}
@@ -999,6 +1022,11 @@ int cli_main(int argc, char **argv) {
 					break;
 				}
 			}
+			if (load_mode == 4 && t.nadd > 0) {
+				/* The transaction needs the file owner map for conflict
+				 * checks; load it only when there is work to do. */
+				db_load_local(c);
+			}
 			if (t.nadd == 0 && t.nrm == 0) {
 				msg("there is nothing to do mreow~");
 				txn_free(&t);
@@ -1074,10 +1102,7 @@ int cli_main(int argc, char **argv) {
 			break;
 		}
 		{
-			int saved = g_overwrite;
-			g_overwrite = 1;
 		rc = txn_run(c, &t, 0);
-			g_overwrite = saved;
 		}
 		break;
 	}

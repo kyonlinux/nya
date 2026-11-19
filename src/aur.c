@@ -349,7 +349,7 @@ static void chown_r(const char *path, uid_t uid, gid_t gid) {
 	nftw(path, chown_cb, 32, FTW_PHYS);
 }
 
-int aur_pkg_exists(config *c, const char *name) {
+static int aur_pkg_latest_version(config *c, const char *name, char *ver, size_t outsz) {
 	if (!aur_enabled(c)) return 0;
 	char *enc = url_encode(name);
 	char url[4600];
@@ -357,22 +357,31 @@ int aur_pkg_exists(config *c, const char *name) {
 	free(enc);
 	char *data;
 	long len;
-	if (dl_url(c, url, &data, &len) != 0) return 1;
+	if (dl_url(c, url, &data, &len) != 0) return -1;
 	json *root = json_parse(data, len);
 	free(data);
-	if (!root) return 1;
+	if (!root) return -1;
 	json *results = json_get(root, "results");
 	int found = 0;
 	json *r;
 	for (r = results ? results->child : NULL; r; r = r->next) {
 		const char *n = json_str(json_get(r, "Name"));
 		if (n && strcmp(n, name) == 0) {
+			const char *v = json_str(json_get(r, "Version"));
+			if (ver) snprintf(ver, outsz, "%s", v ? v : "");
 			found = 1;
 			break;
 		}
 	}
 	json_free(root);
 	return found;
+}
+
+int aur_pkg_exists(config *c, const char *name) {
+	/* Keep the historical fallback: a transient query failure should not
+	 * turn into a "package does not exist" error. */
+	int r = aur_pkg_latest_version(c, name, NULL, 0);
+	return r < 0 ? 1 : r;
 }
 
 static strs g_aur_building;
@@ -664,15 +673,23 @@ int aur_resolve_and_build(config *c, const char *name) {
 	return 0;
 }
 
-int aur_build_install(config *c, const char *name, txn *t) {
+static int aur_build_install_ver(config *c, const char *name, const char *known_ver, txn *t) {
 	if (!aur_enabled(c)) return -1;
 	if (aur_malware_check(c, name)) {
 		error("refusing to install '%s': listed as AUR malware (https://github.com/DeSynkro/aur-scan)", name);
 		return -1;
 	}
-	if (!aur_pkg_exists(c, name)) {
-		warn("%s: not found in the AUR", name);
-		return -1;
+	char want_ver[512] = "";
+	int lookup = 0;
+	if (known_ver && *known_ver) {
+		snprintf(want_ver, sizeof want_ver, "%s", known_ver);
+	} else {
+		lookup = aur_pkg_latest_version(c, name, want_ver, sizeof want_ver);
+		if (lookup == 0) {
+			warn("%s: not found in the AUR", name);
+			return -1;
+		}
+		if (lookup < 0) warn("%s: could not query the AUR; using a cached build if available", name);
 	}
 	if (!makepkg_available()) {
 		error("makepkg not found; install base-devel to build AUR packages");
@@ -693,40 +710,48 @@ int aur_build_install(config *c, const char *name, txn *t) {
 	}
 	char dir[4300];
 	snprintf(dir, sizeof dir, "%s/%s", build, name);
-	char cached_pkg[4400] = "";
-	char cached_fallback[4400] = "";
+	pkg *cached = NULL;
+	pkg *cached_fallback = NULL;
 	if (!g_clean && is_dir(dir)) {
 		DIR *cd = opendir(dir);
 		if (cd) {
 			struct dirent *de;
-			cached_fallback[0] = '\0';
-			char pf[96];
-			snprintf(pf, sizeof pf, "%s-", name);
 			char dbg[128];
 			snprintf(dbg, sizeof dbg, "%s-debug-", name);
 			while ((de = readdir(cd)) != NULL) {
 				if (!(endswith(de->d_name, ".pkg.tar.zst") || endswith(de->d_name, ".pkg.tar.xz") ||
 				      endswith(de->d_name, ".pkg.tar.gz") || endswith(de->d_name, ".pkg.tar")))
 					continue;
-				if (cached_fallback[0] == '\0') snprintf(cached_fallback, sizeof cached_fallback, "%s/%s", dir, de->d_name);
 				if (startswith(de->d_name, dbg)) continue;
-				if (startswith(de->d_name, pf) && cached_pkg[0] == '\0') {
-					snprintf(cached_pkg, sizeof cached_pkg, "%s/%s", dir, de->d_name);
+				char cand[4400];
+				snprintf(cand, sizeof cand, "%s/%s", dir, de->d_name);
+				pkg *pc = pkg_new("aur");
+				pc->filename = xstrdup(cand);
+				if (pkg_scan_archive(c, cand, pc) == 0) {
+					int version_ok = want_ver[0] && pc->version && strcmp(pc->version, want_ver) == 0;
+					if (version_ok) {
+						pkg_free(cached);
+						cached = pc;
+						break;
+					}
+					if (!cached_fallback) cached_fallback = pc;
+					else pkg_free(pc);
+				} else {
+					pkg_free(pc);
 				}
 			}
 			closedir(cd);
 		}
-		if (cached_pkg[0] == '\0' && cached_fallback[0]) snprintf(cached_pkg, sizeof cached_pkg, "%s", cached_fallback);
 	}
-	if (cached_pkg[0]) {
-		pkg *pc = pkg_new("aur");
-		pc->filename = xstrdup(cached_pkg);
-		if (pkg_scan_archive(c, cached_pkg, pc) == 0) {
-			info("Reusing cached AUR package %s-%s", pc->name, pc->version);
-			txn_add_add(t, pc);
-			return 0;
-		}
-		pkg_free(pc);
+	if (!cached && !want_ver[0] && cached_fallback) {
+		cached = cached_fallback;
+		cached_fallback = NULL;
+	}
+	pkg_free(cached_fallback);
+	if (cached) {
+		info("Reusing cached AUR package %s-%s", cached->name, cached->version);
+		txn_add_add(t, cached);
+		return 0;
 	}
 	rm_rf(dir);
 	mkdir_p(dir, 0755);
@@ -826,6 +851,10 @@ int aur_build_install(config *c, const char *name, txn *t) {
 	return 0;
 }
 
+int aur_build_install(config *c, const char *name, txn *t) {
+	return aur_build_install_ver(c, name, NULL, t);
+}
+
 static int aur_name_ignored(config *c, const char *name) {
 	int i;
 	for (i = 0; i < c->ignorepkg.n; i++) {
@@ -843,6 +872,7 @@ int aur_update(config *c, txn *t) {
 		pkg *l = g_local[i];
 		if (!l->name) continue;
 		if (l->is_host) continue;
+		if (l->is_url) continue;
 		if (db_find_sync(l->name)) continue;
 		int seen = 0;
 		int fj;
@@ -860,6 +890,8 @@ int aur_update(config *c, txn *t) {
 	int nfound = 0;
 	strs tobuild;
 	memset(&tobuild, 0, sizeof tobuild);
+	strs buildver;
+	memset(&buildver, 0, sizeof buildver);
 	const int batch = 100;
 	int b;
 	for (b = 0; b < foreign.n; b += batch) {
@@ -911,7 +943,10 @@ int aur_update(config *c, txn *t) {
 			}
 			printf("%saur/%s%s %s%s%s -> %s%s%s\n", col_magenta(), n, col_reset(),
 			       col_bold(), l->version, col_reset(), col_green(), v, col_reset());
-			if (!strs_has(&tobuild, n)) strs_add(&tobuild, n);
+			if (!strs_has(&tobuild, n)) {
+				strs_add(&tobuild, n);
+				strs_add(&buildver, v);
+			}
 			updated++;
 		}
 		json_free(root);
@@ -958,6 +993,7 @@ int aur_update(config *c, txn *t) {
 			if (!jobs[i].ok && !is_file(tarballs[i])) {
 				error("failed to download AUR snapshot for %s", tobuild.v[i]);
 				strs_free(&tobuild);
+				strs_free(&buildver);
 				strs_free(&foreign);
 				free(tarballs); free(dirs); free(jobs);
 				return -1;
@@ -977,14 +1013,16 @@ int aur_update(config *c, txn *t) {
 		free(dirs);
 		free(jobs);
 		for (i = 0; i < tobuild.n; i++) {
-			if (aur_build_install(c, tobuild.v[i], t) != 0) {
+			if (aur_build_install_ver(c, tobuild.v[i], i < buildver.n ? buildver.v[i] : NULL, t) != 0) {
 				strs_free(&tobuild);
+				strs_free(&buildver);
 				strs_free(&foreign);
 				return -1;
 			}
 		}
 	}
 	strs_free(&tobuild);
+	strs_free(&buildver);
 	strs_free(&foreign);
 	if (updated == 0 && nfound > 0) msg("no AUR updates available mreow~");
 	return 0;

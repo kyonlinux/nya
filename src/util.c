@@ -883,7 +883,8 @@ static int is_driver_pkg(const char *name) {
 	       strstr(name, "dkms");
 }
 
-void driver_post_install(txn *t) {
+void driver_post_install(config *c, txn *t) {
+	if (strcmp(c->rootdir, "/") != 0 && c->rootdir[0] != '\0') return;
 	int i, need_mkinitcpio = 0, need_modprobe = 0;
 	for (i = 0; i < t->nadd; i++) {
 		if (is_driver_pkg(t->add[i]->name)) {
