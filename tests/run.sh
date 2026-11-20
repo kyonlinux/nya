@@ -478,7 +478,7 @@ NYA_CONF="$ROOT/auto/nya.conf" $NYA config >/dev/null 2>&1 || true
 ok "first-use config generation"
 
 echo "== version/help =="
-$NYA --version | grep -q "6.0.3" || fail "--version"
+$NYA --version | grep -q "6.0.4" || fail "--version"
 $NYA --help | grep -q "nya install" || fail "--help"
 echo "ok: version/help"
 echo "== sync vs update =="
@@ -1071,6 +1071,13 @@ EOF
 	$NYA $VCFG install confd --noconfirm >/dev/null || fail "install confd with reverse conflict"
 	[ ! -e "$VROOT/usr/bin/confc" ] || fail "reverse-conflicting package was not removed"
 	$NYA $VCFG -Q | grep -q "^confd 1.0-1$" || fail "confd not installed"
+	# stale duplicate local-db directories used to crash after deduplication
+	mkdir -p "$VROOT/var/lib/pacman/local/confd-0.9-1"
+	cp "$VROOT/var/lib/pacman/local/confd-1.0-1/desc" "$VROOT/var/lib/pacman/local/confd-0.9-1/desc"
+	cp "$VROOT/var/lib/pacman/local/confd-1.0-1/files" "$VROOT/var/lib/pacman/local/confd-0.9-1/files"
+	sed -i 's/^1\.0-1$/0.9-1/' "$VROOT/var/lib/pacman/local/confd-0.9-1/desc"
+	$NYA $VCFG -Q | grep -q "^confd 1.0-1$" || fail "duplicate local db entries broke -Q"
+	ok "duplicate local db entries are deduplicated safely"
 	$NYA $VCFG install bar --noconfirm >/dev/null || fail "install bar with versioned dep"
 	$NYA $VCFG -Q | grep -q "^foo 1.0-2$" || fail "versioned dep should pick foo 1.0-2 (pkgrel ignored when unspecified)"
 	$NYA $VCFG -Q | grep -q "^foo 2.0-1$" && fail "versioned dep installed foo 2.0-1 (constraint ignored)"

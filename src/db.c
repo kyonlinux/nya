@@ -8,6 +8,7 @@ hmap *g_owner = NULL;
 static hmap *g_owner_multi = NULL;
 
 static void db_local_owners_add_pkg(pkg *p);
+static void local_index_del(pkg *p);
 
 static void owner_multi_add(const char *f, const char *name) {
 	if (!g_owner_multi) g_owner_multi = hmap_new(1 << 15);
@@ -179,11 +180,11 @@ static void rebuild_sync_prov(void) {
 
 static void local_index_add(pkg *p) {
 	if (!g_local_idx || !p->name) return;
-	if (!hmap_has(g_local_idx, p->name)) hmap_put(g_local_idx, p->name, p);
+	hmap_put(g_local_idx, p->name, p);
 	if (p->name && p->version) {
 		char tmp[1100];
 		snprintf(tmp, sizeof tmp, "%s-%s", p->name, p->version);
-		if (!hmap_has(g_local_dir_idx, tmp)) hmap_put(g_local_dir_idx, tmp, p);
+		hmap_put(g_local_dir_idx, tmp, p);
 	}
 }
 
@@ -210,7 +211,7 @@ static void sync_add(pkg *p) {
 	if (g_sync_name && p->name && !hmap_has(g_sync_name, p->name)) hmap_put(g_sync_name, p->name, p);
 }
 
-static void local_add(pkg *p) {
+static pkg *local_add(config *c, pkg *p, const char *dbdir) {
 	if (!g_local_idx) g_local_idx = hmap_new(1 << 12);
 	if (!g_local_dir_idx) g_local_dir_idx = hmap_new(1 << 12);
 	/* local db dirs are keyed as <name>-<version>; drop stale versions of the same package */
@@ -225,18 +226,28 @@ static void local_add(pkg *p) {
 	if (dup >= 0) {
 		if (p->version && g_local[dup]->version && vercmp(p->version, g_local[dup]->version) > 0) {
 			/* newer version replaces the stale entry */
-			pkg_free(g_local[dup]);
+			pkg *old = g_local[dup];
+			char olddir[4400];
+			if (old->name && old->version)
+				snprintf(olddir, sizeof olddir, "%s/local/%s-%s", c->dbpath, old->name, old->version);
+			else olddir[0] = '\0';
+			local_index_del(old);
+			pkg_free(old);
 			g_local[dup] = p;
 			local_index_add(p);
-			return;
+			if (olddir[0]) rm_rf(olddir);
+			return p;
 		}
-		/* stale version of an already known package: skip */
+		/* stale version of an already known package: skip and remove the
+		 * duplicate local-db directory so pacman stops warning about it */
 		pkg_free(p);
-		return;
+		if (dbdir) rm_rf(dbdir);
+		return g_local[dup];
 	}
 	g_local = xrealloc(g_local, (g_nlocal + 1) * sizeof(pkg *));
 	g_local[g_nlocal++] = p;
 	local_index_add(p);
+	return p;
 }
 
 static void name_version_split(const char *dir, char *name, size_t nlen, char *ver, size_t vlen) {
@@ -506,8 +517,8 @@ int db_load_local_light(config *c) {
 			p->name = xstrdup(name);
 			if (!p->version) p->version = xstrdup(ver);
 		}
-		local_add(p);
-		if (p->name && p->version) db_local_owners_add_pkg(p);
+		pkg *kept = local_add(c, p, entry);
+		if (kept->name && kept->version) db_local_owners_add_pkg(kept);
 	}
 	closedir(d);
 	db_build_owner_map();
@@ -644,9 +655,9 @@ int db_load_local(config *c) {
 			p->name = xstrdup(name);
 			if (!p->version) p->version = xstrdup(ver);
 		}
-		local_add(p);
-		pkg_unload_mtree(p);
-		if (p->name && p->version) db_local_owners_add_pkg(p);
+		pkg *kept = local_add(c, p, entry);
+		pkg_unload_mtree(kept);
+		if (kept->name && kept->version) db_local_owners_add_pkg(kept);
 	}
 	closedir(d);
 	db_build_owner_map();
