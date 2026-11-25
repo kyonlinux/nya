@@ -18,6 +18,6 @@ clean:
 	rm -f nya $(OBJS)
 
 test: nya
-	bash tests/run.sh
+	sh tests/run.sh
 
 .PHONY: clean install test
